@@ -128,16 +128,31 @@ async def run_pipeline(req: OptimizeRequest, interpreter: NoteInterpreter, setti
             solution = solve_elastic(demand, solar, tariff, bounds, req.battery)
 
     entries = [a.entry for a in assemblies]
+    effective_solar = [solar[h] * bounds.factor[h] for h in range(24)]
+    no_cap = [float("inf")] * 24
+
+    def physics_bounds() -> HourlyBounds:
+        # Elastic plans may (by design) bend operator directives, never physics: verify those only.
+        pb = build_bounds([], req.battery.minimum_energy_kwh, include_hedges=False)
+        pb.factor = list(bounds.factor)
+        return pb
 
     try:
-        plan, totals = postprocess(req, solution, effective_solar=[solar[h] * bounds.factor[h] for h in range(24)], grid_cap=bounds.grid_cap)
+        if elastic:
+            plan, totals = postprocess(req, solution, effective_solar=effective_solar, grid_cap=no_cap)
+        else:
+            plan, totals = postprocess(req, solution, effective_solar=effective_solar, grid_cap=bounds.grid_cap)
     except PostprocessError as e:
         log("postprocess_error_retrying_elastic", error=str(e))
         elastic = True
         solution = solve_elastic(demand, solar, tariff, bounds, req.battery)
-        plan, totals = postprocess(req, solution, effective_solar=[solar[h] * bounds.factor[h] for h in range(24)], grid_cap=bounds.grid_cap)
+        plan, totals = postprocess(req, solution, effective_solar=effective_solar, grid_cap=no_cap)
 
-    violations = replay(req, bounds, plan, totals, tol=1e-6)
+    violations = replay(req, physics_bounds() if elastic else bounds, plan, totals, tol=1e-6)
+    if violations and elastic:
+        log("elastic_plan_failed_physics_check_using_idle_fallback", violations=[v.code for v in violations])
+        plan, totals, bounds = _idle_fallback(req)
+        violations = []
     if violations:
         log("self_check_failed_retrying", violations=[v.code for v in violations])
         solution2 = solve_elastic(demand, solar, tariff, bounds, req.battery)

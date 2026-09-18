@@ -17,7 +17,7 @@ from app.guardrails.rule_interpreter import interpret as rule_interpret
 from app.guardrails.validator import validate
 from app.llm.base import LLMError, LLMResult
 from app.llm.cache import InterpretationCache, cache_key
-from app.llm.gemini_client import GeminiClient
+from app.llm.gemini_client import GeminiClient, LLMRateLimitedError
 from app.llm.provider_chain import ProviderChain
 from app.pipeline.deadline import Deadline
 from app.schemas.directives import AppliedDirective, structured_adjustment_for
@@ -120,7 +120,7 @@ class NoteInterpreter:
         primary_timeout_s: float,
         fallback_timeout_s: float,
         max_repairs: int,
-        thinking_budget: int,
+        thinking_budget: int | None,
         cache: InterpretationCache,
         prompt_version: str,
         enable_hedging: bool,
@@ -248,7 +248,10 @@ class NoteInterpreter:
             assembly = NoteAssembly(entry=entry, applied=[], degraded=True)
             used_model = "none"
 
-        self.cache.put(key, assembly)
+        if not assembly.degraded:
+            # Never cache a degraded/failed result: a transient outage or quota burst must not
+            # permanently turn a real directive into no_op for every later identical request.
+            self.cache.put(key, assembly)
         return assembly, trace, used_model
 
     async def _call_and_validate(
@@ -260,10 +263,37 @@ class NoteInterpreter:
         trace: NoteTrace,
         prompt_text_override: str | None = None,
     ) -> tuple[NoteAssembly, str, bool]:
-        note_text = req.operator_notes[note_index]
-        battery = req.battery
         system_prompt = load_system_prompt()
 
+        for attempt in range(2):
+            outcome = await self._try_models(
+                req, note_index, base_contents, deadline, trace, prompt_text_override, system_prompt
+            )
+            if outcome[2] or outcome[3] is None:
+                return outcome[:3]
+            min_wait = outcome[3]
+            # Every model was rate-limited. If the provider's suggested wait fits in the budget,
+            # wait once and retry rather than degrading to the rule interpreter / no_op.
+            if attempt == 0 and min_wait is not None and min_wait + 6.0 < deadline.remaining():
+                trace.add("rate_limited_waiting", wait_s=round(min_wait, 2))
+                await asyncio.sleep(min_wait + 0.2)
+                continue
+            break
+        return NoteAssembly(entry=None, applied=[]), "none", False  # type: ignore[arg-type]
+
+    async def _try_models(
+        self,
+        req: OptimizeRequest,
+        note_index: int,
+        base_contents: list[dict],
+        deadline: Deadline,
+        trace: NoteTrace,
+        prompt_text_override: str | None,
+        system_prompt: str,
+    ) -> tuple[NoteAssembly, str, bool, float | None]:
+        note_text = req.operator_notes[note_index]
+        battery = req.battery
+        rate_waits: list[float] = []
         for model_index, model in enumerate(self.chain.models):
             if self.chain.is_disabled(model):
                 trace.add("model_skipped", model=model, reason="circuit_open")
@@ -285,11 +315,15 @@ class NoteInterpreter:
                     result: LLMResult = await self.chain.call_model(
                         model, system_prompt, contents, deadline, budget, self.thinking_budget
                     )
+                except LLMRateLimitedError as e:
+                    trace.add("llm_error", model=model, error="RateLimited", message=str(e)[:200])
+                    rate_waits.append(e.retry_after_s if e.retry_after_s is not None else 10.0)
+                    break
                 except LLMError as e:
-                    trace.add("llm_error", model=model, error=type(e).__name__, message=str(e))
+                    trace.add("llm_error", model=model, error=type(e).__name__, message=str(e)[:200])
                     break
                 except Exception as e:
-                    trace.add("llm_error", model=model, error=type(e).__name__, message=str(e))
+                    trace.add("llm_error", model=model, error=type(e).__name__, message=str(e)[:200])
                     break
 
                 trace.add(
@@ -344,9 +378,11 @@ class NoteInterpreter:
                     battery.minimum_energy_kwh,
                 )
                 trace.add("assembled", directive_type=assembly.entry.directive_type, hours=(assembly.applied[0].hours if assembly.applied else []))
-                return assembly, model, True
+                return assembly, model, True, None
 
-        return NoteAssembly(entry=None, applied=[]), "none", False  # type: ignore[arg-type]
+        # Some model was only rate-limited (not wrong): worth one wait-and-retry if time allows.
+        wait = min(rate_waits) if rate_waits else None
+        return NoteAssembly(entry=None, applied=[]), "none", False, wait  # type: ignore[arg-type]
 
     @staticmethod
     def _append_repair_turn(

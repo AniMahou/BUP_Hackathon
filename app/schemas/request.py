@@ -8,7 +8,7 @@ def _reject_bool(v):
 
 
 class HourInput(BaseModel):
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     hour: int
     demand_kwh: float
@@ -29,7 +29,7 @@ class HourInput(BaseModel):
 
 
 class BatteryInput(BaseModel):
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     capacity_kwh: float
     initial_energy_kwh: float
@@ -51,7 +51,7 @@ class BatteryInput(BaseModel):
 
 
 class OptimizeRequest(BaseModel):
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="ignore")
 
     scenario_id: str
     operator_notes: list[str]

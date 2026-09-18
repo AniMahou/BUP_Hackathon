@@ -21,7 +21,7 @@ logger = logging.getLogger("gridwise")
 
 
 async def _warm_up(interpreter: NoteInterpreter) -> None:
-    if not settings.gemini_api_key:
+    if not settings.api_key_list:
         logger.warning("GEMINI_API_KEY not set; /optimize-energy will run in degraded mode")
         return
     try:
@@ -46,7 +46,7 @@ async def _warm_up(interpreter: NoteInterpreter) -> None:
 async def lifespan(app: FastAPI):
     setup_logging(settings.log_level)
 
-    client = GeminiClient(settings.gemini_api_key)
+    client = GeminiClient(settings.api_key_list)
     cache = InterpretationCache(settings.interpretation_cache_size)
     interpreter = NoteInterpreter(
         client=client,
@@ -54,7 +54,7 @@ async def lifespan(app: FastAPI):
         primary_timeout_s=settings.llm_timeout_s,
         fallback_timeout_s=settings.llm_fallback_timeout_s,
         max_repairs=settings.llm_max_repairs,
-        thinking_budget=settings.llm_thinking_budget,
+        thinking_budget=settings.thinking_budget,
         cache=cache,
         prompt_version=settings.prompt_version,
         enable_hedging=settings.enable_hedging,

@@ -51,5 +51,5 @@ class LLMClient(Protocol):
         system_prompt: str,
         contents: list[dict],
         timeout_s: float,
-        thinking_budget: int,
+        thinking_budget: int | None,
     ) -> LLMResult: ...

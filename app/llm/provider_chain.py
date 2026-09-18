@@ -9,7 +9,7 @@ import time
 from app.llm.base import LLMAuthError, LLMClient, LLMInvalidRequestError, LLMResult
 from app.pipeline.deadline import Deadline
 
-_CIRCUIT_BREAKER_S = 300.0
+_AUTH_BREAKER_S = 300.0  # 401/403/404: model/key genuinely unusable
 
 
 class ProviderChain:
@@ -28,7 +28,7 @@ class ProviderChain:
         return self.primary_timeout_s if model_index == 0 else self.fallback_timeout_s
 
     async def call_model(
-        self, model: str, system_prompt: str, contents: list[dict], deadline: Deadline, budget_s: float, thinking_budget: int
+        self, model: str, system_prompt: str, contents: list[dict], deadline: Deadline, budget_s: float, thinking_budget: int | None
     ) -> LLMResult:
         timeout_s = deadline.timeout_for(budget_s)
         if timeout_s <= 0.1:
@@ -41,6 +41,10 @@ class ProviderChain:
                 timeout_s=timeout_s,
                 thinking_budget=thinking_budget,
             )
-        except (LLMAuthError, LLMInvalidRequestError):
-            self._disabled_until[model] = time.monotonic() + _CIRCUIT_BREAKER_S
+        except LLMAuthError:
+            self._disabled_until[model] = time.monotonic() + _AUTH_BREAKER_S
+            raise
+        except LLMInvalidRequestError:
+            # A 400 is specific to this request (e.g. a model rejecting one config). Move on to the
+            # next model for THIS call, but never switch the model off for other requests.
             raise

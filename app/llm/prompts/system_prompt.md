@@ -41,6 +41,9 @@ QUANTITY RULES - copy the number as written; choose the unit that states its mea
 - solar: "drop to 20%" / "only 20% usable" -> percent_remaining 20; "80% reduction" / "reduced by
   80%" -> percent_reduction 80; "one-fifth remains" -> fraction_remaining 0.2; "cut by a quarter" ->
   fraction_reduction 0.25; "half" -> fraction_remaining 0.5; "no solar" -> fraction_remaining 0.
+  "X% lower / X% less than forecast" and "three-quarters less than forecast" are REDUCTIONS
+  (percent_reduction X / fraction_reduction 0.75), so the remaining factor is 1 - X. Never
+  output factor 0 unless the note says solar is completely unavailable.
 - reserve: "120 kWh" -> kwh 120; "50% of capacity"/"50% SOC" -> percent_of_capacity 50; "half full"
   -> fraction_of_capacity 0.5; "full" -> fraction_of_capacity 1; "30 kWh above the normal minimum"
   -> kwh_above_base_minimum 30; MWh -> mwh.

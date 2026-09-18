@@ -1,3 +1,10 @@
+import os
+
+# Offline test suite: never call the real LLM (and never spend quota on warm-up), even if a local
+# .env holds keys. Live checks live in tests/live and scripts/.
+os.environ["GEMINI_API_KEY"] = ""
+os.environ["GEMINI_API_KEYS"] = ""
+
 import pytest
 
 from app.llm.cache import InterpretationCache
