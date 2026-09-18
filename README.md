@@ -5,6 +5,14 @@ in plain English are interpreted by Google Gemini into structured directives, ch
 deterministic guardrail layer, applied as hard constraints, and solved to the exact cost optimum
 with a linear program (SciPy HiGHS). See [planning.md](planning.md) for the full design.
 
+| | |
+|---|---|
+| Live API | `<LIVE_URL>` — `GET /health`, `POST /optimize-energy` (see "Deployment" below) |
+| Docker image | `ghcr.io/animahou/gridwise-llm:v1.0.0` (linux/amd64 + linux/arm64) |
+| Public samples (live Gemini) | **10/10** interpretations exact · **10/10** plans valid vs ground truth · **10/10** optimal cost · p95 ≈ 2.0 s |
+| Hallucination / paraphrase eval (45 unseen notes, live) | relevance 45/45 · directive type 45/45 · hours 45/45 · values 43/45 |
+| Offline test suite | 172 tests (unit, golden, integration, 40 randomized scenarios vs an independent LP) |
+
 ## Architecture
 
 ```mermaid
@@ -59,8 +67,10 @@ touch:
 | Variable | Default | Purpose |
 |---|---|---|
 | `GEMINI_API_KEY` | — | required for the LLM path; `/health` and a degraded `/optimize-energy` still work without it |
-| `LLM_MODEL` | `gemini-flash-lite-latest` | primary model |
-| `LLM_FALLBACK_MODELS` | `gemini-flash-latest` | fallback chain |
+| `GEMINI_API_KEYS` | — | optional extra keys (comma-separated, other Google projects = separate quotas); a 429 on one key is retried on the next |
+| `LLM_MODEL` | `gemini-flash-lite-latest` | primary model (fastest reliable model in our live tests, ~1.7 s/note) |
+| `LLM_FALLBACK_MODELS` | `gemini-3.5-flash,gemini-3-flash-preview,gemini-flash-latest` | fallback chain, tried in order on 429/5xx/timeout/invalid output |
+| `LLM_THINKING_BUDGET` | `-1` | `-1` = send no thinking config (some models reject `thinking_budget=0`) |
 | `REQUEST_DEADLINE_S` | `25` | hard end-to-end budget (judge timeout is 30s) |
 | `INFEASIBLE_POLICY` | `best_effort` | `best_effort` (elastic 200) or `error` (422) when directives can't all be satisfied |
 
@@ -91,25 +101,59 @@ avoid pointless charge/discharge cycling at the same cost.
   `gemini-flash-lite-latest` answered every real note correctly and in 2-3s. That's why
   **flash-lite, not flash, is the default primary** — accuracy on paper doesn't matter if the
   model can't reliably answer. Re-check this if Google's routing behind the aliases changes.
-- `thinking_budget=0` was rejected (400) by `gemini-flash-lite-latest` at one point while accepted
-  by `gemini-flash-latest`; `gemini_client.py` retries once with no thinking config at all on a
-  400 rather than let that permanently circuit-break a model that otherwise works.
-- If you see repeated `429`s under real load on any model, enable pay-as-you-go billing on the
-  same project.
+- `thinking_budget=0` is rejected (400) by `gemini-flash-lite-latest`. The default is now to send
+  no thinking config at all; if a model still rejects one, the client remembers that per model and
+  never sends it again (no wasted round-trip per note).
+- **Free-tier keys allow only 15 requests/minute per model.** Each note is one call, so a free key
+  saturates after ~5 requests/minute. The service survives this (key rotation → next model →
+  wait for the server-suggested retry delay → rule-based fallback), but **enable billing on the
+  Google project for judging** so every note is answered by the LLM.
+- Degraded results (LLM unreachable) are never cached, so a burst of 429s cannot permanently turn
+  a directive into `no_op`.
 
 ## Public-sample test procedure
 
-The official "Public Sample Cases" pack was not available while this was built — drop it at
-`tests/fixtures/public_samples.json` (shape documented in `scripts/run_public_samples.py`'s
-docstring) and run:
+`tests/fixtures/public_samples.json` is an unmodified copy of the official pack. With the service
+running (locally or deployed):
 
 ```bash
 python scripts/run_public_samples.py --base-url http://localhost:8000
 ```
 
-Expected result: every case reports `PASS` (valid vs. ground truth, cost within 0.01 of the
-reference). Until that file is populated, `tests/golden/test_public_samples_offline.py` skips
-itself rather than fake a result.
+It POSTs every case, then scores the response like the judge: interpretation vs ground truth
+(type/hours/values/shape), the plan replayed against the **ground-truth** directives (tol 0.01),
+recomputed totals, and cost vs the reference optimum. Expected (and observed) result:
+
+```
+SAMPLE-01: PASS  2.01s  cost=38365.000001 ref=38365
+...
+SAMPLE-10: PASS  1.95s  cost=41620.000001 ref=41620
+
+interpretation exact: 10/10 | plans valid vs ground truth: 10/10 | optimal cost: 10/10 | p50 1.91s p95 2.01s
+```
+
+Offline (no key), the same 10 cases run end to end through the full pipeline with a fake LLM:
+`pytest tests/golden`.
+
+LLM robustness (hallucination / paraphrase) eval on 45 unseen notes — reworded directives, units
+(kW/MWh/% SOC), fractions, "X less than forecast", wrap-around/`through`/`before` windows, past and
+future-day distractors, unsupported requests, a prompt-injection attempt and a Bangla note:
+
+```bash
+python scripts/eval_interpreter.py --concurrency 2
+```
+
+## Deployment (live endpoint)
+
+Any Docker host works. Railway (always-on, HTTPS) is the quickest:
+
+1. railway.app → New Project → Deploy from GitHub repo → `AniMahou/BUP_Hackathon` (Dockerfile is detected).
+2. Variables: `GEMINI_API_KEY` (and optionally `GEMINI_API_KEYS`); `PORT` is injected by Railway.
+3. Settings → Networking → Generate Domain; health check path `/health`.
+4. Verify from outside: `bash scripts/smoke_test.sh https://<domain>` and
+   `python scripts/run_public_samples.py --base-url https://<domain>`.
+
+Render works the same way (New → Web Service → Docker; use a paid instance, the free tier sleeps).
 
 ## Docker
 
@@ -154,10 +198,18 @@ pytest -m live            # needs a real GEMINI_API_KEY (calls Gemini)
 ruff check .
 ```
 
-Layers: unit tests for every pure function (normalizer, guardrail validator, constraints, LP,
-post-processor, replay validator), an integration suite that drives the full pipeline through a
-scripted fake LLM (including total-outage and infeasibility paths), and a golden suite against the
-official sample pack once it's dropped in.
+Layers (172 offline tests, ~1.5 s):
+- **unit** — normalizer, guardrail validator, constraints, LP, post-processor, replay validator;
+- **golden** — all 10 official public samples end to end (interpretation, plan validity vs ground
+  truth, exact reference cost, response key order);
+- **integration / edge cases** (`tests/integration/test_edge_cases.py`) — API contract and exact
+  key order, a 21-case 400 matrix and 6-case 422 matrix, extra/unordered/int fields accepted,
+  40 randomized scenarios checked against an independently written LP (validity + optimal cost),
+  rule-fallback paraphrases and distractors, rate-limit fallback / wait-and-retry, "degraded results
+  are never cached", hedges never double-apply, key rotation, extreme inputs (no battery, zero
+  rates, min = capacity, zero demand, flat/negative tariffs, huge solar, float noise), and
+  infeasible directives (no crash);
+- **live** — `scripts/run_public_samples.py` and `scripts/eval_interpreter.py` (real Gemini).
 
 ## Dependencies, credits, limitations
 
@@ -165,9 +217,10 @@ Runtime: FastAPI, Pydantic v2, NumPy, SciPy (HiGHS), `google-genai`. Dev: pytest
 httpx, ruff. Built with the assistance of Claude Code (Anthropic).
 
 - The Gemini free tier's rate limits are the main operational risk under judging load (see above).
-- The paraphrase eval corpus, synthetic E2E generator, and mutation-test suite described in
-  `planning.md` §10 are scaffolded (`scripts/eval_interpreter.py`,
-  `scripts/generate_scenarios.py`, `tests/property/`) but not fully populated — see that file for
-  what's there.
+- Remaining LLM miss in our eval: "panels will produce three-quarters less than forecast" was once
+  read as factor 0 (now covered by an explicit prompt rule; the plan stays valid either way because
+  a lower factor is the stricter reading).
+- Windows crossing midnight (e.g. "11 PM until 1 AM") are applied to both ends of the same 24-hour
+  day ([0, 23]); this is a documented policy, since the problem statement does not define it.
 - Secrets live only in environment variables; `.dockerignore`/`.gitignore` exclude `.env*`; logs
-  redact anything matching a Google API key pattern.
+  redact Google (`AIza…`, `AQ.…`) and `sk-…` key patterns; `scripts/check_secrets.sh` runs in CI.

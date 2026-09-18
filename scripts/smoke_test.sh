@@ -10,7 +10,7 @@ echo
 echo "POST ${URL}/optimize-energy (sample request)"
 curl -sf -X POST "${URL}/optimize-energy" \
   -H "Content-Type: application/json" \
-  -d @tests/fixtures/sample_request.json | python -m json.tool
+  -d @tests/fixtures/sample_request.json | "$(command -v python3 || command -v python)" -m json.tool | head -40
 
 echo
 echo "Smoke test passed."
