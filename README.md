@@ -120,6 +120,15 @@ curl http://localhost:8000/health
 ```
 
 Multi-arch publish: `docker buildx build --platform linux/amd64,linux/arm64 -t <you>/gridwise-llm:1.0.0 --push .`
+(or push a `v*` tag — `.github/workflows/docker-publish.yml` builds and pushes automatically to
+`ghcr.io/<owner>/gridwise-llm` using the repo's built-in token, no extra secrets needed).
+
+**GHCR packages default to private.** After the first successful run, go to the package's
+GitHub page (linked from the repo sidebar under "Packages") → Package settings → change
+visibility to **Public** — otherwise judges can't `docker pull` it anonymously, which is exactly
+what the rubric checks (§9 of planning.md). `.github/workflows/ci.yml` runs lint + offline tests +
+secret scan on every push/PR; both workflow files were empty scaffold placeholders until this was
+filled in — if you see an old GitHub Actions failure email predating this, that's why.
 
 ## The reasoning UI
 
