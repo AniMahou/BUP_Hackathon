@@ -11,8 +11,8 @@
 | Decision | Choice | Why |
 |---|---|---|
 | Language / framework | **Python 3.12 + FastAPI + Pydantic v2** | Best LP ecosystem, fast to build, strict schema validation |
-| LLM | **Anthropic Claude** via official `anthropic` Python SDK (`AsyncAnthropic`), **structured outputs** (`output_config.format` = JSON schema) | Schema-guaranteed JSON, strong paraphrase understanding |
-| Default model | `claude-opus-5` (effort `low`) → fallback chain `claude-sonnet-5` → `claude-haiku-4-5` (same API key) | Most capable first; the fallbacks cover rate limits, overload and latency. Final choice comes from a measured bake-off (§4.3) |
+| LLM | **Google Gemini** via official `google-genai` Python SDK (`genai.Client(...).aio`), **structured outputs** (`response_mime_type="application/json"` + `response_schema`) | Schema-guaranteed JSON, strong paraphrase understanding, usable free tier |
+| Default model | `gemini-flash-lite-latest` (thinking budget 0) → fallback `gemini-flash-latest` (same API key) | **Confirmed empirically, not just a risk on paper:** `gemini-2.5-pro`/`-flash`/`-flash-lite` (dated model IDs) were already deprecated for a freshly-issued key by the time this was tested, 404ing with a message pointing at a newer model — so the chain uses Google's `-latest` aliases instead of pinned versions to survive the next rotation. `gemini-pro-latest` hit a `429` (quota exhausted) on the very first call, so Pro isn't in the default chain at all. Between the two Flash-tier aliases, **`-lite` turned out to be the reliable one**: `gemini-flash-latest` returned 503/504 on several real structured-output calls (even though a plain unstructured call to it succeeded) while `gemini-flash-lite-latest` answered every test note correctly in 2-3s — so it, not the larger Flash, is primary. This is the opposite of "most capable first," chosen because a model that can't reliably answer scores zero regardless of capability. Re-run the bake-off (§4.3) periodically since this is all live-service behavior that can change |
 | LLM call pattern | **One LLM call per operator note, in parallel** (all notes given as context), prompt-cached system prompt | Latency is driven by output tokens, so running calls in parallel keeps p95 low. It also isolates failures and allows per-note caching and repair |
 | Interpretation design | **Dual channel**: the LLM outputs (a) *evidence*: time windows plus the quantity *as written* with its unit or meaning, and (b) its *final* values. Deterministic code recomputes the final values from the evidence and cross-checks. | Removes LLM mistakes in arithmetic, percentages and end-exclusive ranges. The LLM still produces the interpretation, which keeps us compliant |
 | Guardrails | Exact Section-08 validator, **repair loop** (re-ask with specific errors), **constraint-correction loop** (re-ask when directives make the LP infeasible), safe no_op fallback | Covers the "safe failure" requirement and the 25-point interpretation category |
@@ -115,12 +115,13 @@ A `Deadline` object (monotonic clock) is passed through the pipeline. Every LLM 
 |---|---|
 | `app/api` | Routes, raw-body JSON parsing, error mapping (400/422/500), no stack traces |
 | `app/schemas` | Pydantic models: request, response, directive types, LLM output schema |
-| `app/llm` | Provider abstraction, Anthropic client, fallback chain, interpreter (prompt building, parallel calls, repair turns), cache, prompts |
+| `app/llm` | Provider abstraction, Gemini client, fallback chain, interpreter (prompt building, parallel calls, repair turns), cache, prompts |
 | `app/guardrails` | Deterministic normalization (time windows, quantities), Section-08 validator, cross-checks (dual channel, grounding, rule parser), rule-based last-resort interpreter, assembler |
 | `app/optimizer` | Directive → per-hour bounds, LP model, solver (stage 1/2, elastic), infeasibility diagnostics, post-processing |
 | `app/verification` | Judge-mirror replay validator (shared by runtime, tests and scripts) |
 | `app/pipeline` | Orchestrator (end-to-end flow, fallbacks, deadlines) |
 | `app/summary` | Deterministic `plan_summary` and explanation templates |
+| `app/static` | A small demo UI (plain HTML/CSS/JS, no build step) that drives `POST /ui/optimize` — the same pipeline as the graded `POST /optimize-energy`, plus a `trace` field showing the per-note reasoning steps and pipeline stages. The graded endpoint's response shape is untouched; the UI is additive, not part of the scored contract. |
 
 ---
 
@@ -138,34 +139,36 @@ A `Deadline` object (monotonic clock) is passed through the pipeline. Every LLM 
 ### 4.2 Call strategy
 
 - **Per-note parallel calls** (`asyncio.gather`). Each call gets:
-  - *System prompt* (static, ~3–4k tokens: rules + canonical tables + ~26 few-shot examples) marked `cache_control: {"type":"ephemeral","ttl":"1h"}` so it is cached (Opus 5 min cacheable prefix 512 tokens, Sonnet 5 1024, Haiku 4.5 4096. Keep the prompt above 4096 tokens if Haiku ends up primary). **No timestamps or IDs in the system prompt** (they silently break caching).
+  - *System prompt* (static, ~3–4k tokens: rules + canonical tables + ~26 few-shot examples). Current-generation Gemini models cache repeated prefixes **implicitly and automatically** (no `cache_control` block to set) once the prefix is long enough and stable — keep the system prompt byte-identical across calls and **no timestamps or IDs in it** (they silently break the cache match, same failure mode as on any provider). Implicit caching is opportunistic (not guaranteed), so don't treat the discount/latency win as certain; if we need a guaranteed hit we can switch to explicit caching (`client.caches.create(...)`, referenced by `cached_content=`) — **verify the current implicit-cache minimum token count and hit behavior for the actual models in `LLM_MODEL`/`LLM_FALLBACK_MODELS` in the Phase 0 smoke test**, since it varies by model and changes over time (and, as §4.3 now documents, the specific model IDs behind those env vars can themselves change).
   - *User message* (variable): battery context (capacity, base minimum, initial, rates), **all notes with indices** (context for cross-references such as "during that same window"), the **target note index and text**.
-- **Output**: one `NoteInterpretationLLM` object (schema §4.4) via `output_config={"format": {"type":"json_schema","schema": ...}, "effort": "low"}`.
+- **Output**: one `NoteInterpretationLLM` object (schema §4.4) via `generation_config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=NoteInterpretationLLM, temperature=0, max_output_tokens=..., thinking_config=types.ThinkingConfig(thinking_budget=...))`. Passing the Pydantic model directly as `response_schema` is supported by `google-genai`; confirm the compiled schema matches our hand-written JSON schema in Phase 0 (see §4.4 caveats).
 - **Why not one batched call?** Latency grows with output tokens: 3 notes × ~150 tokens in one call is roughly 3× slower than 3 parallel calls. Per-note calls also let us cache, repair and fall back one note at a time.
-- **Interpretation cache**: in-process LRU (`INTERPRETATION_CACHE_SIZE`, default 2048) keyed by `sha256(prompt_version, schema_version, model, battery params, all notes, target index)`. The judge's repeated requests become instant and **deterministic**. Stability is scored, and Opus 5/Sonnet 5 do not accept `temperature`, so the cache is our determinism tool.
-- **Warm-up at startup** (background task, never blocks `/health`): one dummy interpretation call. It compiles the structured-output schema (first-use compile cost; the compiled schema is cached for 24 h), warms the prompt cache and verifies the API key. Only a sanitized error is logged, never the key.
+- **Interpretation cache**: in-process LRU (`INTERPRETATION_CACHE_SIZE`, default 2048) keyed by `sha256(prompt_version, schema_version, model, battery params, all notes, target index)`. The judge's repeated requests become instant and **deterministic**. Unlike Claude Opus/Sonnet, Gemini *does* accept `temperature`, so we set `temperature=0` as a first determinism layer — the cache remains the belt-and-braces layer on top, since `temperature=0` narrows but does not guarantee bit-identical output.
+- **Warm-up at startup** (background task, never blocks `/health`): one dummy interpretation call. It exercises the structured-output path once, gives the implicit cache its best shot at a hit on the first real request, and verifies the API key. Only a sanitized error is logged, never the key.
 
 ### 4.3 Model and provider configuration
 
 | Setting | Default | Notes |
 |---|---|---|
-| SDK | `anthropic` (Python, 1.x), `AsyncAnthropic` | 1.x is built on `httpx2`; pass timeouts as float seconds or `anthropic.Timeout` |
-| Primary model | `claude-opus-5` | Adaptive thinking is on by default. We send `output_config.effort="low"` for latency. **Do not send `temperature`/`top_p`** (400 on Opus 5 / Sonnet 5) |
-| Fallback models | `claude-sonnet-5`, then `claude-haiku-4-5` | Separate per-model rate limits and fewer overload errors. **Haiku 4.5: do not send `effort`** (errors). `temperature=0` allowed |
-| Refusal fallback | Opus 5 supports server-side `fallbacks: "default"` (beta header `server-side-fallback-2026-07-01`) | Enable if compatible with structured outputs (verify in Phase 0 smoke test). Always check `stop_reason`: `refusal` or `max_tokens` → treat as a failed attempt and move to the next model |
-| `max_tokens` | 4096 per call | Thinking tokens count toward it. Truncation (`stop_reason="max_tokens"`) = failure → retry |
-| Timeout per attempt | primary 10 s, fallbacks 6 s (bounded by the deadline) | Via `client.with_options(timeout=..., max_retries=0)`. **We** control retries across models |
-| Retries | Transient (429 / 5xx / 529 / timeout / connection) → next model in chain; 400/401/403/404 → mark that model "disabled" for 5 min (circuit breaker) and move on | Catch typed exceptions most-specific-first: `NotFoundError` → `AuthenticationError`/`PermissionDeniedError` → `RateLimitError` → `APIStatusError` (≥500) → `APIConnectionError`/`APITimeoutError` |
-| Optional | Opus 5 **fast mode** (beta `fast-mode-2026-02-01`, `speed="fast"`, premium price) | Only if the bake-off shows Opus 5 is the most accurate but misses the latency target |
+| SDK | `google-genai` (Python), `genai.Client(api_key=...)`, async via `client.aio.models.generate_content(...)` | Built on `httpx`; pass `http_options=types.HttpOptions(timeout=...)` per call for per-attempt timeouts |
+| Primary model | `gemini-flash-lite-latest` | **Changed twice after live testing** (see the TL;DR row above): first from Pro to Flash-tier (`gemini-pro-latest` returned `429 RESOURCE_EXHAUSTED` on the first call), then from `gemini-flash-latest` to `gemini-flash-lite-latest` specifically, because Flash itself 503/504'd on several real structured-output calls while Flash-Lite answered every one correctly in 2-3s. `thinking_budget=0` for latency. `temperature=0` for determinism |
+| Fallback model | `gemini-flash-latest` | Larger/more capable than Lite when it does answer; kept as fallback rather than dropped since the instability we saw may be transient load, not a permanent property of the model. (Pro is still available manually via `LLM_MODEL=gemini-pro-latest` if quota/billing is sorted out and its extra accuracy is worth pursuing — re-run the bake-off before doing that) |
+| `thinking_budget` quirk | `gemini-flash-lite-latest` rejected `thinking_budget=0` with `400 INVALID_ARGUMENT` the first time we tried it, then accepted it after a retry with no `thinking_config` at all — model-specific support for a zero thinking budget is not stable enough to trust blindly | `gemini_client.py` retries once with no `thinking_config` on any 400, before treating it as a real invalid-request failure and circuit-breaking the model. Don't let one model's current thinking-budget quirk take it out of the chain for 5 minutes when it would otherwise work fine |
+| Model IDs | Use `-latest` aliases (`gemini-flash-latest`, `gemini-flash-lite-latest`, `gemini-pro-latest`), not pinned dated IDs | **Confirmed the hard way:** `gemini-2.5-pro`/`-flash`/`-flash-lite` — dated IDs that were current at design time — were already returning 404 ("no longer available to new users") on a freshly-issued key, with the error naming a newer replacement model. An alias tracks Google's current recommendation instead of freezing a version that can be deprecated mid-competition. Re-verify the alias list at `GET /v1beta/models?key=...` if this happens again |
+| Safety filtering | Gemini applies safety filters by default and can return `finish_reason=SAFETY`/`PROHIBITED_CONTENT` instead of the JSON we asked for | Treat any non-`STOP` `finish_reason` (`MAX_TOKENS`, `SAFETY`, `RECITATION`, `PROHIBITED_CONTENT`, `OTHER`, …) as a failed attempt and move to the next model. This is a **new failure mode vs. Claude** — the prompt-injection distractor notes (§4.12) are exactly the kind of text that can trip a safety filter, so this must be in the eval corpus and failure-mode tests, not just assumed away |
+| `max_output_tokens` | 4096 per call | Thinking tokens are generally counted against this budget on models that support thinking — confirm in Phase 0, and raise the cap or lower the thinking budget if truncation shows up in testing. Truncation (`finish_reason="MAX_TOKENS"`) = failure → retry |
+| Timeout per attempt | primary 10 s, fallback 6 s (bounded by the deadline) | Via `http_options=types.HttpOptions(timeout=...)`; **we** control retries across models, so set the SDK's own retry count to 0 where configurable |
+| Retries | Transient (429 `RESOURCE_EXHAUSTED` / 500 / 503 `UNAVAILABLE` / timeout / connection) → next model in chain; 400 `INVALID_ARGUMENT` / 401/403 `PERMISSION_DENIED` / 404 `NOT_FOUND` → mark that model "disabled" for 5 min (circuit breaker) and move on | Catch typed exceptions most-specific-first: `google.genai.errors.ClientError` (inspect `.code`/`.status` for 400/401/403/404/429) → `google.genai.errors.ServerError` (5xx) → `httpx.TimeoutException`/connection errors |
+| Free-tier quota | Per-model RPM/RPD/TPM caps apply on the Google AI Studio free tier, and **Pro's is tight enough to fail on the very first call** on our test key, while Flash-tier models did not | Quotas change over time and per key — check current values at ai.google.dev before the event and load-test at the concurrency judges are likely to use (§10.4 Gate E). If the free tier can't sustain judging traffic, enable pay-as-you-go billing on the same API key/project ahead of submission (§15) |
 
-**Model bake-off (Phase 3, ~15 min):** `scripts/eval_interpreter.py --models claude-opus-5,claude-sonnet-5,claude-haiku-4-5 --corpus tests/fixtures/paraphrase_corpus.jsonl` reports per-dimension accuracy plus p50/p95 latency per model.
-**Decision rule:** pick the most accurate model whose **p95 for the interpretation stage is ≤ 3.0 s** at 3 parallel notes. Ties go to the faster model. The team makes the final call; the default stays `claude-opus-5` unless measurements say otherwise.
+**Model bake-off (Phase 3, ~15 min):** `scripts/eval_interpreter.py --models gemini-flash-latest,gemini-flash-lite-latest,gemini-pro-latest --corpus tests/fixtures/paraphrase_corpus.jsonl` reports per-dimension accuracy plus p50/p95 latency per model.
+**Decision rule:** pick the most accurate model whose **p95 for the interpretation stage is ≤ 3.0 s** at 3 parallel notes, *and* whose free-tier quota/availability can sustain the expected judging concurrency. Ties go to the faster/higher-quota model. The team makes the final call; the default is now `gemini-flash-lite-latest` (changed twice from the originally-planned Pro-first order: Pro 429'd immediately, then plain Flash turned out less reliable than Flash-Lite under our real workload on this key) — revisit periodically, since this ranking is live-service behavior, not a fixed property of the models.
 
-**Cost estimate** (per request, 3 notes, ~3.5k cached system tokens + ~300 uncached input + ~200 output each, before thinking tokens): Opus 5 ≈ $0.02–0.03, Sonnet 5 ≈ $0.01, Haiku 4.5 ≈ $0.005–0.015 (the upper end applies if the prompt stays below Haiku's 4096-token cache minimum). **$20–40 of credits covers development, evaluation and judging comfortably.**
+**Cost:** the Google AI Studio free tier has $0 cost up to its per-model quota; the real risk is **hitting the rate limit mid-judging**, not runaway spend (unlike the Anthropic pay-as-you-go plan this replaces). If quota testing shows the free tier is too tight, enabling billing on the same project is still effectively free at hackathon volume (a few hundred requests) — do this proactively rather than discovering a 429 storm during evaluation.
 
 ### 4.4 LLM output schema (`NoteInterpretationLLM`, strict JSON schema)
 
-Field order matters: reasoning comes first, so the model "thinks" before committing. All fields are required, nullable fields use `anyOf [..., null]`, and every object has `additionalProperties: false`. The API does not support numeric `minimum`/`maximum` in schemas, so **ranges are enforced in code** (guardrails).
+Field order matters: reasoning comes first, so the model "thinks" before committing. All fields are required. Gemini's `response_schema` is an OpenAPI-3.0 subset (via `google-genai` Pydantic-model conversion): nullable fields come from `X | None` typing rather than a hand-written `anyOf [..., null]`, and **there is no `additionalProperties: false` equivalent** — Gemini's schema can't forbid extra keys the way Anthropic's could, so an extra/hallucinated key is a risk we now catch only in code (the guardrail validator must reject unknown keys explicitly, not just assume the schema blocked them). Numeric `minimum`/`maximum` are not reliably enforced either, so **ranges stay enforced in code** (guardrails), same as before. **Verify the exact compiled schema Gemini receives (e.g. via the SDK's schema-dump helper) in the Phase 0 smoke test** — silent lossy conversion of `Literal`/enum/nested-`Optional` fields is the most likely integration bug when porting a schema across providers.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -452,7 +455,7 @@ Exact key order as §2. `scenario_id` echoed byte-for-byte. `hourly_plan` sorted
 
 ## 7. Performance and reliability (10 pts)
 
-- **p95 target ≤ 4 s** end to end (rubric: ≤ 5 s = full 3 pts). Levers: parallel per-note calls, prompt caching, `effort="low"`, compact output schema, interpretation cache, warm-up, model choice (bake-off).
+- **p95 target ≤ 4 s** end to end (rubric: ≤ 5 s = full 3 pts). Levers: parallel per-note calls, implicit prompt caching, low/zero thinking budget, compact output schema, interpretation cache, warm-up, model choice (bake-off).
 - **Deadlines:** `REQUEST_DEADLINE_S=25`. LLM attempt timeouts are derived from the remaining budget.
 - **Concurrency:** Uvicorn `--workers ${WEB_CONCURRENCY:-2}`, async LLM I/O, LP in threadpool. Target: 10 concurrent requests without 5xx.
 - **Circuit breaker:** a model returning 401/403/404 is skipped for 5 minutes.
@@ -465,10 +468,10 @@ Exact key order as §2. `scenario_id` echoed byte-for-byte. `hourly_plan` sorted
 
 ## 8. Security and secrets
 
-- Secrets only via environment variables (`ANTHROPIC_API_KEY`). `.env` is gitignored and `.env.example` lists names only.
+- Secrets only via environment variables (`GEMINI_API_KEY`). `.env` is gitignored and `.env.example` lists names only.
 - No secrets in the image (`.dockerignore` excludes `.env*`, `.git`, tests data not needed at runtime).
 - Error responses never include exception text from providers, stack traces or config values.
-- Logs redact anything that looks like a key (`sk-ant-…` regex filter in the logging formatter).
+- Logs redact anything that looks like a key (`AIza[0-9A-Za-z_-]{35}` regex filter in the logging formatter — Google AI Studio key shape; keep the pattern loose enough to survive a future key-format change).
 - Notes are treated as **data** in prompts. Injection attempts cannot change the schema or the allowed types (structured outputs + enum + guardrails).
 - `scripts/check_secrets.sh` (grep for key patterns) runs in CI and before every push.
 - Repo stays **private during the event** and is made **public after the deadline**.
@@ -486,12 +489,12 @@ Avoid public Hugging Face Spaces (they would expose the code during the event).
 - `python:3.12-slim`, `PYTHONDONTWRITEBYTECODE=1`, `PYTHONUNBUFFERED=1`, install `requirements.txt` (no dev deps), copy `app/`, non-root user, `EXPOSE 8000`.
 - `CMD`: `uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers ${WEB_CONCURRENCY:-2}` (shell form so `$PORT` from the platform works).
 - `HEALTHCHECK` with `python -c "urllib.request.urlopen('http://127.0.0.1:${PORT}/health')"` (no curl in slim).
-- `/health` works **without** `ANTHROPIC_API_KEY`. Without a key, `/optimize-energy` runs in degraded mode and logs a clear warning.
+- `/health` works **without** `GEMINI_API_KEY`. Without a key, `/optimize-energy` runs in degraded mode and logs a clear warning.
 
 ### 9.3 Registry and multi-arch
 - `docker buildx build --platform linux/amd64,linux/arm64 -t <dockerhub_user>/gridwise-llm:1.0.0 --push .` (judges may use Apple Silicon or x86).
 - Record the **exact tag and digest** (`docker buildx imagetools inspect`) in the README and the submission.
-- Verify on a clean machine or in CI: `docker pull …` → `docker run -p 8000:8000 -e ANTHROPIC_API_KEY=… …` → `/health` → one public sample.
+- Verify on a clean machine or in CI: `docker pull …` → `docker run -p 8000:8000 -e GEMINI_API_KEY=… …` → `/health` → one public sample.
 - `.github/workflows/docker-publish.yml` builds and pushes on tag `v*` (optional; manual buildx is fine).
 
 ---
@@ -541,7 +544,7 @@ Profiles modelled on the samples: night demand 80–120, day/evening 150–230; 
 | E (deploy) | Public URL smoke OK from outside the dev network; load test p95 ≤ 5 s at concurrency 5, 0 × 5xx in 100 requests; Docker image pulled fresh → /health OK → sample OK |
 
 ### 10.5 CI (`.github/workflows/ci.yml`)
-On push: install → `ruff check` → `pytest -m "not live"` → `scripts/check_secrets.sh`. Live tests run manually (`workflow_dispatch` with the repo secret `ANTHROPIC_API_KEY`).
+On push: install → `ruff check` → `pytest -m "not live"` → `scripts/check_secrets.sh`. Live tests run manually (`workflow_dispatch` with the repo secret `GEMINI_API_KEY`).
 
 ### 10.6 Commands (to be wired in `Makefile`)
 `make install` · `make run` · `make test` (offline) · `make test-live` · `make eval` · `make samples URL=…` · `make e2e URL=… N=200` · `make load URL=…` · `make docker-build` · `make docker-run` · `make smoke URL=…` · `make lint`
@@ -574,7 +577,7 @@ On push: install → `ruff check` → `pytest -m "not live"` → `scripts/check_
 │   ├── llm/
 │   │   ├── __init__.py
 │   │   ├── base.py                # LLMClient protocol, LLMResult, error taxonomy
-│   │   ├── anthropic_client.py    # AsyncAnthropic wrapper, per-model param profiles
+│   │   ├── gemini_client.py       # genai.Client wrapper, per-model param profiles
 │   │   ├── provider_chain.py      # model fallback chain, timeouts, circuit breaker
 │   │   ├── interpreter.py         # prompt assembly, parallel per-note calls, repair turns
 │   │   ├── cache.py               # LRU interpretation cache
@@ -699,10 +702,10 @@ async def run_pipeline(req: OptimizeRequest) -> dict   # response in exact key o
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | — (required for LLM path) | Claude API key (never committed) |
-| `LLM_MODEL` | `claude-opus-5` | Primary model |
-| `LLM_FALLBACK_MODELS` | `claude-sonnet-5,claude-haiku-4-5` | Ordered fallback chain |
-| `LLM_EFFORT` | `low` | `output_config.effort` (not sent to Haiku 4.5) |
+| `GEMINI_API_KEY` | — (required for LLM path) | Google AI Studio Gemini API key (never committed) |
+| `LLM_MODEL` | `gemini-flash-lite-latest` | Primary model (Flash-Lite, not Pro or plain Flash — see §4.3) |
+| `LLM_FALLBACK_MODELS` | `gemini-flash-latest` | Ordered fallback chain |
+| `LLM_THINKING_BUDGET` | `0` | `thinking_config.thinking_budget` (Flash/Flash-Lite can go to 0; Pro may enforce a non-zero minimum — verify in Phase 0) |
 | `LLM_TIMEOUT_S` | `10` | Primary attempt timeout |
 | `LLM_FALLBACK_TIMEOUT_S` | `6` | Fallback attempt timeout |
 | `LLM_MAX_REPAIRS` | `1` | Repair rounds per note |
@@ -721,9 +724,9 @@ async def run_pipeline(req: OptimizeRequest) -> dict   # response in exact key o
 
 ## 14. Dependencies and credits (pin exact versions during implementation)
 
-Runtime: `fastapi`, `uvicorn[standard]`, `pydantic` (v2), `pydantic-settings`, `numpy`, `scipy` (HiGHS LP), `anthropic` (official SDK, 1.x).
+Runtime: `fastapi`, `uvicorn[standard]`, `pydantic` (v2), `pydantic-settings`, `numpy`, `scipy` (HiGHS LP), `google-genai` (official SDK).
 Dev/test: `pytest`, `pytest-asyncio`, `pytest-timeout`, `hypothesis`, `httpx` (FastAPI `TestClient`), `ruff`, optionally `pulp` (independent solver for a cross-check test only).
-External services: Anthropic Claude API; container registry (Docker Hub or GHCR); host (Railway / Render / Cloud Run); optional uptime monitor (UptimeRobot / cron-job.org).
+External services: Google Gemini API (AI Studio); container registry (Docker Hub or GHCR); host (Railway / Render / Cloud Run); optional uptime monitor (UptimeRobot / cron-job.org).
 All of these are credited in the README, which also discloses the AI coding assistant used.
 
 ---
@@ -732,12 +735,12 @@ All of these are credited in the README, which also discloses the AI coding assi
 
 | # | Item | Why | Notes |
 |---|---|---|---|
-| 1 | **Anthropic API key** with credits (≥ $20–40 recommended) | LLM interpretation (mandatory) | console.anthropic.com → API keys. Confirm the key can call `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5`. **Check the org's rate limits** (RPM per model); if RPM < ~100, add credits to move up a tier. Give it to the running service as an env var only; never paste it into code or chat logs that get committed |
+| 1 | **Gemini API key** (Google AI Studio, free tier) | LLM interpretation (mandatory) | aistudio.google.com → Get API key. **Confirmed on our test key:** dated model IDs (`gemini-2.5-pro` etc.) can already be deprecated for a new key (404, "no longer available to new users") — use `-latest` aliases instead, and confirm the key can call `gemini-flash-latest`/`gemini-flash-lite-latest`/`gemini-pro-latest` via `GET /v1beta/models?key=...`. **Also confirmed: Pro's free-tier quota exhausted on the first call** while Flash worked — don't assume Pro is usable without checking; if load testing (§10.4 Gate E) shows the free tier can't sustain judging concurrency, enable pay-as-you-go billing on the same project before submission. Give the key to the running service as an env var only — **never paste it into a committed file**; `.env.example` is the tracked template (blank values only) and `.env` (gitignored) holds the real one |
 | 2 | **Hosting account** (Railway recommended) connected to the GitHub repo | Live public endpoint | Needs access to the private repo `AniMahou/BUP_Hackathon`. Render needs a paid instance to avoid sleep |
 | 3 | **Container registry**: Docker Hub account + access token (or GHCR with a GitHub PAT `write:packages`) | Docker fallback image (4 pts) | The image must be **public** and pullable during evaluation |
 | 4 | Local **Docker Desktop** with buildx (for multi-arch build) | Build and verify the image | Or we let GitHub Actions build it |
 | 5 | Optional: **UptimeRobot** (free) | Keep-alive + outage alerts | Ping `/health` every 5 min |
-| 6 | Optional: second-vendor LLM key (OpenAI/Gemini) | Vendor-level failover | Only if you already have one; not required (the model chain already covers rate limits and overload) |
+| 6 | Optional: second-vendor LLM key (Anthropic/OpenAI) | Vendor-level failover | Only if you already have one; not required (the model chain already covers per-model rate limits, but a second *vendor* would also survive a Gemini-wide outage or a free-tier quota exhaustion that the fallback chain alone can't, since all three fallback models currently share one Google account's quota) |
 | 7 | **Team roles**: who runs which workstream (§12), who records the video, who submits | Parallel execution | |
 | 8 | Repo admin action **after the deadline**: make the repository public | Rule compliance | Keep it private until then |
 
@@ -747,9 +750,9 @@ All of these are credited in the README, which also discloses the AI coding assi
 
 | Time | Phase | Deliverable | Owner |
 |---|---|---|---|
-| 20:05–20:25 | **P0 Bootstrap** | requirements, config, `/health`, stub `/optimize-energy`, Dockerfile, deploy to host → **public URL live**; Anthropic key smoke call (structured output + effort + optional refusal fallback) | WS-C |
+| 20:05–20:25 | **P0 Bootstrap** | requirements, config, `/health`, stub `/optimize-energy`, Dockerfile, deploy to host → **public URL live**; Gemini key smoke call (structured output schema compiles as expected, thinking budget, finish_reason handling, free-tier quota check) | WS-C |
 | 20:05–21:00 | **P1 Core math** (parallel) | request parser, schemas, constraints, LP, post-process, replay, summary; **golden offline 10/10**; property + mutation tests | WS-A |
-| 20:05–21:00 | **P1 LLM** (parallel) | LLM schema, prompt v1 + examples, Anthropic client + chain, normalizer, guardrails, repair loop, cache, fake LLM, unit tests | WS-B |
+| 20:05–21:00 | **P1 LLM** (parallel) | LLM schema, prompt v1 + examples, Gemini client + chain, normalizer, guardrails, repair loop, cache, fake LLM, unit tests | WS-B |
 | 21:00–21:25 | **P2 Integrate** | orchestrator, error matrix, deadlines; live public samples 10/10; redeploy | WS-C (+A, B) |
 | 21:25–22:05 | **P3 Accuracy** | paraphrase corpus (≥200), eval + model bake-off, prompt iterations, hedging, regex cross-check, constraint-correction loop, failure-mode tests | WS-B (+A) |
 | 22:05–22:30 | **P4 Hardening + ship** | synthetic E2E, load test from outside, multi-arch Docker push (tag + digest), final deploy, Gate E | WS-C |
@@ -768,10 +771,10 @@ Deploy early and often: every green merge to `main` redeploys automatically.
 **README.md sections**
 1. Overview + live URL + Docker image (exact tag + digest)
 2. Architecture diagram: LLM → guardrails → optimizer → final validator (1 pt)
-3. **Quickstart from a clean machine** (3 pts): `git clone` → `python -m venv .venv` → `pip install -r requirements.txt` → `cp .env.example .env` (set `ANTHROPIC_API_KEY`) → `uvicorn app.main:app --port 8000` → `curl /health` → `curl -X POST /optimize-energy -d @tests/fixtures/sample_request.json`
+3. **Quickstart from a clean machine** (3 pts): `git clone` → `python -m venv .venv` → `pip install -r requirements.txt` → `cp .env.example .env` (set `GEMINI_API_KEY`) → `uvicorn app.main:app --port 8000` → `curl /health` → `curl -X POST /optimize-energy -d @tests/fixtures/sample_request.json`
 4. **Configuration and model/provider** (2 pts): env table (§13), models, what the LLM does, guardrails summary
 5. **Public-sample test procedure + expected result** (2 pts): `python scripts/run_public_samples.py --base-url http://localhost:8000` → expected "10/10 valid, interpretations 10/10, cost matches reference"
-6. **Docker** (1 pt): `docker pull …` / `docker run -p 8000:8000 -e ANTHROPIC_API_KEY=… …` / health check
+6. **Docker** (1 pt): `docker pull …` / `docker run -p 8000:8000 -e GEMINI_API_KEY=… …` / health check
 7. **Dependencies, credits, known limitations, secret handling** (1 pt)
 8. Testing guide (offline, live, eval, E2E, load)
 

@@ -1,0 +1,21 @@
+[project]
+name = "gridwise-llm"
+version = "1.0.0"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# E501: long lines are fine. UP046: PEP 695 generics are 3.12-only syntax; requirements.txt/CI
+# target 3.12, but this stays 3.11-compatible for local dev where 3.12 isn't installed.
+ignore = ["E501", "UP046"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "live: needs a real GEMINI_API_KEY and network access",
+]
+testpaths = ["tests"]

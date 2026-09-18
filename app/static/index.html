@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GridWise LLM</title>
+<style>
+  :root {
+    --bg: #0b1020; --panel: #131a2e; --panel-2: #1a2440; --border: #263156;
+    --text: #e7ecff; --muted: #93a0c9; --accent: #5b8cff; --good: #33d17a;
+    --warn: #f5b942; --bad: #ff6767; --mono: "SFMono-Regular", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif; padding: 20px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .layout { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .panel + .panel { margin-top: 16px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  input[type=text], textarea {
+    width: 100%; background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 8px; font-size: 13px; font-family: inherit;
+  }
+  textarea { font-family: var(--mono); resize: vertical; }
+  .note-row { display: flex; gap: 6px; margin-bottom: 6px; }
+  .note-row input { flex: 1; }
+  .note-row button { flex: 0 0 auto; }
+  button {
+    background: var(--accent); color: white; border: none; border-radius: 6px;
+    padding: 8px 14px; font-size: 13px; cursor: pointer;
+  }
+  button.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .run-btn { width: 100%; padding: 12px; font-size: 14px; margin-top: 14px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .status { font-size: 13px; color: var(--muted); margin-top: 10px; min-height: 18px; }
+  .status.err { color: var(--bad); }
+
+  .stage-list { list-style: none; margin: 8px 0 0; padding: 0; }
+  .stage-list li {
+    padding: 6px 8px; border-left: 2px solid var(--border); margin-bottom: 2px; font-size: 12px;
+    color: var(--muted);
+  }
+  .stage-list li b { color: var(--text); }
+  .stage-list li.err-stage { border-left-color: var(--bad); }
+  .stage-list li.ok-stage { border-left-color: var(--good); }
+
+  .note-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 10px; background: var(--panel-2); }
+  .note-card .note-text { font-size: 13px; margin-bottom: 6px; }
+  .badge { display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 999px; background: var(--panel); border: 1px solid var(--border); color: var(--muted); margin-right: 4px; }
+  .badge.applies { color: var(--good); border-color: var(--good); }
+  .badge.noop { color: var(--muted); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: right; padding: 4px 6px; border-bottom: 1px solid var(--border); }
+  th:first-child, td:first-child { text-align: left; }
+  .action-charge { color: var(--good); }
+  .action-discharge { color: var(--warn); }
+  .action-idle { color: var(--muted); }
+
+  .totals { display: flex; gap: 18px; flex-wrap: wrap; margin: 10px 0 16px; }
+  .totals .stat { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; min-width: 120px; }
+  .totals .stat .label { font-size: 11px; color: var(--muted); }
+  .totals .stat .value { font-size: 18px; font-weight: 600; }
+  .summary-text { font-size: 13px; color: var(--muted); line-height: 1.5; }
+
+  .chart-wrap { overflow-x: auto; }
+  svg text { fill: var(--muted); font-size: 9px; }
+</style>
+</head>
+<body>
+  <h1>GridWise LLM</h1>
+  <div class="sub">Type operator notes, run the pipeline, and watch the interpretation + optimization reasoning unfold.</div>
+
+  <div class="layout">
+    <div>
+      <div class="panel">
+        <label>Scenario ID</label>
+        <input type="text" id="scenarioId" value="demo-scenario" />
+
+        <label>Operator notes (1-3)</label>
+        <div id="notes"></div>
+        <button class="secondary" id="addNote" type="button">+ Add note</button>
+
+        <details>
+          <summary>Advanced: scenario data (24h demand/solar/tariff + battery)</summary>
+          <label>Scenario JSON (hours + battery)</label>
+          <textarea id="scenarioJson" rows="14"></textarea>
+        </details>
+
+        <button class="run-btn" id="runBtn" type="button">Interpret &amp; Optimize</button>
+        <div class="status" id="status"></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h3 style="margin-top:0">Reasoning trace</h3>
+        <div id="pipelineStages"></div>
+        <div id="noteCards"></div>
+      </div>
+
+      <div class="panel" id="resultsPanel" hidden>
+        <h3 style="margin-top:0">Result</h3>
+        <div class="totals" id="totals"></div>
+        <div class="summary-text" id="summaryText"></div>
+        <div class="chart-wrap"><svg id="chart" width="760" height="220"></svg></div>
+        <details>
+          <summary>Hourly plan table</summary>
+          <table id="planTable"></table>
+        </details>
+      </div>
+    </div>
+  </div>
+
+<script>
+const DEFAULT_NOTES = ["Solar output will drop to about 20% from 1 PM to 3 PM."];
+
+function defaultScenario() {
+  const hours = [];
+  for (let h = 0; h < 24; h++) {
+    let demand, solar, tariff;
+    if (h < 6) { demand = 90 + h * 3; tariff = 5; }
+    else if (h < 17) { demand = 160 + (h % 5) * 8; tariff = 12; }
+    else if (h < 22) { demand = 210 + (h % 3) * 6; tariff = 28; }
+    else { demand = 120; tariff = 8; }
+    solar = (h >= 6 && h <= 17) ? Math.round(180 * Math.sin(((h - 6) / 11) * Math.PI)) : 0;
+    hours.push({ hour: h, demand_kwh: demand, solar_kwh: Math.max(0, solar), tariff_bdt_per_kwh: tariff });
+  }
+  return {
+    hours,
+    battery: {
+      capacity_kwh: 200, initial_energy_kwh: 120, minimum_energy_kwh: 40,
+      max_charge_kwh_per_hour: 50, max_discharge_kwh_per_hour: 50,
+    },
+  };
+}
+
+const notesContainer = document.getElementById("notes");
+function renderNoteInputs(values) {
+  notesContainer.innerHTML = "";
+  values.forEach((v, i) => {
+    const row = document.createElement("div");
+    row.className = "note-row";
+    const input = document.createElement("input");
+    input.type = "text"; input.value = v; input.placeholder = `Note ${i + 1}`;
+    row.appendChild(input);
+    if (values.length > 1) {
+      const rm = document.createElement("button");
+      rm.className = "secondary"; rm.type = "button"; rm.textContent = "x";
+      rm.onclick = () => { values.splice(i, 1); renderNoteInputs(values); };
+      row.appendChild(rm);
+    }
+    notesContainer.appendChild(row);
+  });
+}
+let noteValues = [...DEFAULT_NOTES];
+renderNoteInputs(noteValues);
+
+document.getElementById("addNote").onclick = () => {
+  const inputs = notesContainer.querySelectorAll("input");
+  noteValues = Array.from(inputs).map(i => i.value);
+  if (noteValues.length >= 3) return;
+  noteValues.push("");
+  renderNoteInputs(noteValues);
+};
+
+document.getElementById("scenarioJson").value = JSON.stringify(defaultScenario(), null, 2);
+
+function setStatus(text, isErr) {
+  const el = document.getElementById("status");
+  el.textContent = text || "";
+  el.className = "status" + (isErr ? " err" : "");
+}
+
+const STAGE_LABELS = {
+  cache_hit: "Cache hit — identical request seen before",
+  llm_response: "Gemini responded",
+  llm_error: "Model call failed",
+  model_skipped: "Model skipped (circuit open)",
+  normalization_error: "Normalization error",
+  guardrail_issues: "Guardrail check found issues",
+  repair_requested: "Requesting repair from the model",
+  guardrail_blocking_after_repairs: "Still invalid after repairs — trying next model",
+  guardrail_soft_accept_with_fallback: "Accepted with an automatic correction",
+  assembled: "Directive assembled",
+  degraded_rule_interpreter: "Degraded mode: rule-based interpreter used",
+  safe_fallback_no_op: "Safe fallback: treated as no_op",
+  correction_failed_keeping_previous: "Constraint-correction call failed; kept previous reading",
+};
+
+function renderNoteTrace(nt) {
+  const card = document.createElement("div");
+  card.className = "note-card";
+  const label = nt.phase === "correction" ? ` (constraint-correction retry)` : "";
+  card.innerHTML = `<div class="note-text"><b>Note ${nt.note_index}${label}:</b> ${escapeHtml(nt.note_text)}</div>`;
+  const ul = document.createElement("ul");
+  ul.className = "stage-list";
+  (nt.stages || []).forEach(s => {
+    const li = document.createElement("li");
+    let text = STAGE_LABELS[s.stage] || s.stage;
+    const extras = [];
+    if (s.model) extras.push(s.model);
+    if (s.directive_type) extras.push(s.directive_type);
+    if (s.codes) extras.push(s.codes.join(","));
+    if (s.analysis) extras.push(`"${s.analysis}"`);
+    if (extras.length) text += " — " + extras.join(" · ");
+    li.innerHTML = text;
+    if (s.stage === "llm_error" || s.stage === "safe_fallback_no_op") li.classList.add("err-stage");
+    if (s.stage === "assembled") li.classList.add("ok-stage");
+    ul.appendChild(li);
+  });
+  card.appendChild(ul);
+  return card;
+}
+
+function renderPipelineStages(stages) {
+  const container = document.getElementById("pipelineStages");
+  container.innerHTML = "<b style='font-size:12px;color:var(--muted)'>Pipeline</b>";
+  const ul = document.createElement("ul");
+  ul.className = "stage-list";
+  (stages || []).forEach(s => {
+    const li = document.createElement("li");
+    li.textContent = `${s.stage} (t=${s.t_s}s)`;
+    ul.appendChild(li);
+  });
+  container.appendChild(ul);
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function renderChart(plan) {
+  const svg = document.getElementById("chart");
+  svg.innerHTML = "";
+  const W = 760, H = 220, padL = 30, padB = 20, padT = 10;
+  const chartW = W - padL - 10, chartH = H - padB - padT;
+  const maxVal = Math.max(1, ...plan.map(p => p.grid_kwh + p.solar_used_kwh), ...plan.map(p => p.battery_energy_after_kwh));
+  const barW = chartW / plan.length;
+
+  function bar(x, y, w, h, color) {
+    return `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${color}" />`;
+  }
+  let html = "";
+  plan.forEach((p, i) => {
+    const x = padL + i * barW;
+    const gridH = (p.grid_kwh / maxVal) * chartH;
+    const solarH = (p.solar_used_kwh / maxVal) * chartH;
+    const yBase = H - padB;
+    html += bar(x + 1, yBase - gridH, barW - 2, gridH, "#5b8cff");
+    html += bar(x + 1, yBase - gridH - solarH, barW - 2, solarH, "#f5b942");
+    if (i % 3 === 0) html += `<text x="${x + barW / 2}" y="${H - 5}" text-anchor="middle">${p.hour}</text>`;
+  });
+  let linePoints = plan.map((p, i) => {
+    const x = padL + i * barW + barW / 2;
+    const y = (H - padB) - (p.battery_energy_after_kwh / maxVal) * chartH;
+    return `${x},${y}`;
+  }).join(" ");
+  html += `<polyline points="${linePoints}" fill="none" stroke="#33d17a" stroke-width="2" />`;
+  html += `<text x="${padL}" y="${padT}" fill="#93a0c9">kWh (grid=blue, solar=amber, battery energy=green line)</text>`;
+  svg.innerHTML = html;
+}
+
+function renderPlanTable(plan) {
+  const table = document.getElementById("planTable");
+  let html = "<tr><th>Hour</th><th>Grid</th><th>Solar</th><th>Action</th><th>Batt kWh</th><th>Energy after</th></tr>";
+  plan.forEach(p => {
+    html += `<tr><td>${String(p.hour).padStart(2, "0")}:00</td><td>${p.grid_kwh.toFixed(1)}</td><td>${p.solar_used_kwh.toFixed(1)}</td>` +
+      `<td class="action-${p.battery_action}">${p.battery_action}</td><td>${p.battery_kwh.toFixed(1)}</td><td>${p.battery_energy_after_kwh.toFixed(1)}</td></tr>`;
+  });
+  table.innerHTML = html;
+}
+
+document.getElementById("runBtn").onclick = async () => {
+  const btn = document.getElementById("runBtn");
+  btn.disabled = true;
+  setStatus("Running...");
+  document.getElementById("resultsPanel").hidden = true;
+  document.getElementById("noteCards").innerHTML = "";
+  document.getElementById("pipelineStages").innerHTML = "";
+
+  try {
+    const inputs = notesContainer.querySelectorAll("input");
+    const notes = Array.from(inputs).map(i => i.value.trim()).filter(Boolean);
+    if (notes.length === 0) throw new Error("Add at least one operator note.");
+
+    let scenario;
+    try {
+      scenario = JSON.parse(document.getElementById("scenarioJson").value);
+    } catch (e) {
+      throw new Error("Scenario JSON is invalid: " + e.message);
+    }
+
+    const body = {
+      scenario_id: document.getElementById("scenarioId").value || "demo-scenario",
+      operator_notes: notes,
+      hours: scenario.hours,
+      battery: scenario.battery,
+    };
+
+    const resp = await fetch("/ui/optimize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.message || `Request failed (${resp.status})`);
+    }
+
+    renderPipelineStages(data.trace.stages);
+    const cardsEl = document.getElementById("noteCards");
+    (data.trace.note_traces || []).forEach(nt => cardsEl.appendChild(renderNoteTrace(nt)));
+
+    const r = data.response;
+    document.getElementById("resultsPanel").hidden = false;
+    document.getElementById("totals").innerHTML = `
+      <div class="stat"><div class="label">Total grid</div><div class="value">${r.total_grid_kwh.toFixed(1)} kWh</div></div>
+      <div class="stat"><div class="label">Total cost</div><div class="value">${r.total_cost_bdt.toFixed(1)} BDT</div></div>
+      <div class="stat"><div class="label">Peak grid</div><div class="value">${r.peak_grid_kwh.toFixed(1)} kWh</div></div>
+    `;
+    document.getElementById("summaryText").textContent = r.plan_summary;
+    renderChart(r.hourly_plan);
+    renderPlanTable(r.hourly_plan);
+    setStatus("Done.");
+  } catch (e) {
+    setStatus(e.message || String(e), true);
+  } finally {
+    btn.disabled = false;
+  }
+};
+</script>
+</body>
+</html>
