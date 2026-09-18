@@ -10,8 +10,8 @@ with a linear program (SciPy HiGHS). See [planning.md](planning.md) for the full
 | Live API | `<LIVE_URL>` — `GET /health`, `POST /optimize-energy` (see "Deployment" below) |
 | Docker image | `ghcr.io/animahou/gridwise-llm:v1.0.0` (linux/amd64 + linux/arm64) |
 | Public samples (live Gemini) | **10/10** interpretations exact · **10/10** plans valid vs ground truth · **10/10** optimal cost · p95 ≈ 2.0 s |
-| Hallucination / paraphrase eval (45 unseen notes, live) | relevance 45/45 · directive type 45/45 · hours 45/45 · values 43/45 |
-| Offline test suite | 172 tests (unit, golden, integration, 40 randomized scenarios vs an independent LP) |
+| Hallucination / paraphrase eval (live) | our 45 unseen notes: 45/45 · another team's 57 hand-labelled notes: 57/57 (after two guardrail fixes) |
+| Offline test suite | 229 tests (unit, golden incl. 53 external judge-style cases, integration, 40 randomized scenarios vs an independent LP) |
 
 ## Architecture
 
@@ -174,7 +174,24 @@ what the rubric checks (§9 of planning.md). `.github/workflows/ci.yml` runs lin
 secret scan on every push/PR; both workflow files were empty scaffold placeholders until this was
 filled in — if you see an old GitHub Actions failure email predating this, that's why.
 
-## The reasoning UI
+## Demo frontend (`frontend/`)
+
+A single-page demo app built from our Google Stitch designs (plain HTML + Tailwind CDN + Chart.js,
+no build step), with a **dark/light theme toggle** (top-right). Seven screens, all driven by real API
+responses: **Run** (samples, editable battery, 1–3 notes) → **Processing** (live pipeline) →
+**Understand** (note → rule card with 24-hour strip, guardrail ticks, model used, auto-correction /
+fallback tags) → **Plan** (KPIs + energy-mix / battery / price charts with directive bands) →
+**Verify** (7 judge rules re-checked in the browser) → **Details** (hourly table, raw JSON, trace)
+→ **How it works**.
+
+- Same origin (simplest): start the backend, open `http://localhost:8000/app/`.
+- Standalone: `python -m http.server 5500 -d frontend`, open
+  `http://127.0.0.1:5500/?api=http://127.0.0.1:8000`.
+
+It calls `POST /ui/optimize` (identical pipeline to `/optimize-energy`, plus a reasoning trace) and
+`GET /ui/info`; the judged endpoints are untouched.
+
+## The reasoning UI (debug)
 
 `http://localhost:8000/ui/` is a small single-page app (plain HTML/CSS/JS, no build step) for
 exploring the pipeline interactively: type 1-3 operator notes (a default 24-hour scenario is

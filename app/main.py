@@ -5,6 +5,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -71,6 +72,15 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="GridWise LLM", lifespan=lifespan)
 
+    # The demo frontend may run as its own local server (e.g. :5173). Only localhost origins are
+    # allowed; the judged endpoints are server-to-server and unaffected by CORS.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
+
     @app.middleware("http")
     async def add_request_id(request: Request, call_next):
         request.state.request_id = str(uuid.uuid4())
@@ -98,6 +108,11 @@ def create_app() -> FastAPI:
     static_dir = os.path.join(os.path.dirname(__file__), "static")
     if os.path.isdir(static_dir):
         app.mount("/ui", StaticFiles(directory=static_dir, html=True), name="ui")
+
+    # Demo frontend (frontend/): same origin at /app/, no build step.
+    frontend_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
+    if os.path.isdir(frontend_dir):
+        app.mount("/app", StaticFiles(directory=frontend_dir, html=True), name="app")
 
     return app
 

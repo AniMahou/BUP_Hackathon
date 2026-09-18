@@ -50,9 +50,10 @@ async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--concurrency", type=int, default=2)
     ap.add_argument("--only", default="")
+    ap.add_argument("--corpus", default=str(CORPUS), help="JSONL; rows may carry their own battery / context_notes")
     args = ap.parse_args()
 
-    rows = [json.loads(line) for line in CORPUS.read_text("utf-8").splitlines() if line.strip()]
+    rows = [json.loads(line) for line in Path(args.corpus).read_text("utf-8").splitlines() if line.strip()]
     if args.only:
         wanted = set(args.only.split(","))
         rows = [r for r in rows if r["id"] in wanted]
@@ -72,11 +73,13 @@ async def main() -> int:
     async def run(row):
         nonlocal degraded
         async with sem:
-            req = OptimizeRequest.model_validate({"scenario_id": row["id"], "operator_notes": [row["note"]], "hours": hours, "battery": BATTERY})
+            notes = row.get("context_notes") or [row["note"]]
+            idx = row.get("note_index", 0)
+            req = OptimizeRequest.model_validate({"scenario_id": row["id"], "operator_notes": notes, "hours": hours, "battery": row.get("battery", BATTERY)})
             t0 = time.monotonic()
             res = await interpreter.interpret_request(req, Deadline(25))
             latencies.append(time.monotonic() - t0)
-            got = res.entries[0].model_dump()
+            got = res.entries[idx].model_dump()
             degraded += bool(res.meta.get("degraded"))
             candidates = [row["expected"], *[{"directive_type": row["expected"]["directive_type"], "structured_adjustment": a} for a in row["acceptable"]]]
             best = max((matches(got, c) for c in candidates), key=sum)
@@ -84,7 +87,7 @@ async def main() -> int:
                 score[k] += ok
             score["exact"] += all(best)
             flag = "OK  " if all(best) else "FAIL"
-            model = res.meta.get("per_note_model", ["?"])[0]
+            model = res.meta.get("per_note_model", ["?"] * (idx + 1))[idx]
             print(f"{flag} {row['id']} [{row['tag']}] via {model}: {row['note'][:70]}")
             if not all(best):
                 print(f"       got      {got['directive_type']} {got['structured_adjustment']}")

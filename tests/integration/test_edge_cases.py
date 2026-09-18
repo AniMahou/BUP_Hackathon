@@ -448,3 +448,36 @@ async def test_infeasible_directives_do_not_crash(make_request):
     res = await run_pipeline(make_request([note]), interp, Settings(infeasible_policy="best_effort"))
     assert len(res.response.hourly_plan) == 24
     assert res.response.directive_interpretation[0].directive_type == "max_grid_window"
+
+
+@pytest.mark.parametrize("phrase,value", [("down by three-quarters", 0.75), ("two-thirds of forecast", 2 / 3), ("four-fifths lower", 0.8)])
+def test_grounding_knows_compound_fractions(phrase, value):
+    """Regression: 'three-quarters' was not recognised as 0.75, so a correct LLM answer failed the
+    grounding check and the forced repair round pushed the model to a wrong factor."""
+    from app.guardrails.quantities import is_grounded
+    from app.schemas.llm_output import Quantity
+
+    assert is_grounded(Quantity(value=value, unit="fraction_reduction", source_text=phrase), f"Solar will be {phrase} from 10 to 1 PM.")
+
+
+def test_gemini_http_deadline_never_below_provider_minimum():
+    """Regression: Gemini rejects HTTP deadlines < 10 s with 400 INVALID_ARGUMENT, which silently
+    disabled every fallback model (6 s budget)."""
+    import asyncio
+
+    import app.llm.gemini_client as gc
+
+    seen = {}
+
+    class FakeModels:
+        async def generate_content(self, model, contents, config):
+            seen["timeout_ms"] = config.http_options.timeout
+            return "RESPONSE"
+
+    class FakeClient:
+        aio = type("A", (), {"models": FakeModels()})()
+
+    client = gc.GeminiClient(["k"])
+    client._clients["k"] = FakeClient()
+    assert asyncio.run(client._call_once("k", "m", "sys", [], 6.0, None)) == "RESPONSE"
+    assert seen["timeout_ms"] >= 10_000

@@ -10,6 +10,7 @@ Resilience features (all learned from live runs against real keys):
 - 5xx / 503 "high demand" / 504 deadline errors are transient → the caller moves to the next model.
 """
 
+import asyncio
 import re
 import time
 
@@ -29,6 +30,10 @@ from app.schemas.llm_output import NoteInterpretationLLM
 _OK_FINISH_REASONS = {"STOP"}
 _TRUNCATED_FINISH_REASONS = {"MAX_TOKENS"}
 _RETRY_DELAY_RE = re.compile(r"retry in ([0-9.]+)s", re.IGNORECASE)
+# Gemini rejects any request whose HTTP deadline is < 10 s with "400 INVALID_ARGUMENT: Manually set
+# deadline ... is too short". So the HTTP deadline sent to Google is always >= 11 s, and our own
+# (shorter) per-attempt budget is enforced client-side with asyncio.wait_for instead.
+_MIN_PROVIDER_DEADLINE_S = 11.0
 
 
 class LLMRateLimitedError(LLMTransientError):
@@ -77,10 +82,13 @@ class GeminiClient:
             max_output_tokens=4096,
             thinking_config=(types.ThinkingConfig(thinking_budget=thinking_budget) if thinking_budget is not None else None),
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-            http_options=types.HttpOptions(timeout=max(1000, int(timeout_s * 1000))),
+            http_options=types.HttpOptions(timeout=int(max(_MIN_PROVIDER_DEADLINE_S, timeout_s) * 1000)),
         )
         try:
-            return await self._client_for(key).aio.models.generate_content(model=model, contents=contents, config=config)
+            return await asyncio.wait_for(
+                self._client_for(key).aio.models.generate_content(model=model, contents=contents, config=config),
+                timeout=max(0.5, timeout_s),
+            )
         except genai_errors.ClientError as e:
             code = getattr(e, "code", None)
             if code == 429:
