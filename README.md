@@ -5,9 +5,15 @@ in plain English are interpreted by Google Gemini into structured directives, ch
 deterministic guardrail layer, applied as hard constraints, and solved to the exact cost optimum
 with a linear program (SciPy HiGHS). See [planning.md](planning.md) for the full design.
 
+**Live now:** **https://gridwise-9fk6.onrender.com**
+[`/app`](https://gridwise-9fk6.onrender.com/app/) (demo UI) ·
+[`/ui`](https://gridwise-9fk6.onrender.com/ui/) (reasoning-trace debug UI) ·
+[`/health`](https://gridwise-9fk6.onrender.com/health) ·
+`POST /optimize-energy` (the graded endpoint)
+
 | | |
 |---|---|
-| Live API | `<LIVE_URL>` — `GET /health`, `POST /optimize-energy` (see "Deployment" below) |
+| Live API | `https://gridwise-9fk6.onrender.com` — `GET /health`, `POST /optimize-energy` (deployed on Render's free tier; see [Deployment](#deployment-live-endpoint)) |
 | Docker image | `ghcr.io/animahou/gridwise-llm:v1.0.1` (linux/amd64 + linux/arm64) |
 | Public samples (live Gemini) | **10/10** interpretations exact · **10/10** plans valid vs ground truth · **10/10** optimal cost · p95 ≈ 2.0 s |
 | Hallucination / paraphrase eval (live) | our 45 unseen notes: 45/45 · another team's 57 hand-labelled notes: 57/57 (after two guardrail fixes) |
@@ -183,15 +189,30 @@ python scripts/eval_interpreter.py --concurrency 2
 
 ## Deployment (live endpoint)
 
-Any Docker host works. Railway (always-on, HTTPS) is the quickest:
+**Currently deployed on [Render](https://render.com)'s free tier at
+https://gridwise-9fk6.onrender.com** — no credit card required anywhere in this setup. Any other
+Docker host works too (Railway, Fly.io, Cloud Run); Render is what's actually live.
 
-1. railway.app → New Project → Deploy from GitHub repo → `AniMahou/BUP_Hackathon` (Dockerfile is detected).
-2. Variables: `GEMINI_API_KEY` (and optionally `GEMINI_API_KEYS`); `PORT` is injected by Railway.
-3. Settings → Networking → Generate Domain; health check path `/health`.
-4. Verify from outside: `bash scripts/smoke_test.sh https://<domain>` and
-   `python scripts/run_public_samples.py --base-url https://<domain>`.
+**How it's set up:**
 
-Render works the same way (New → Web Service → Docker; use a paid instance, the free tier sleeps).
+1. render.com → sign up with GitHub (no card) → **New +** → **Web Service** → connect
+   `AniMahou/BUP_Hackathon`. Render auto-detects the root `Dockerfile`.
+2. Instance type: **Free**. Environment variables: `GEMINI_API_KEY` (and optionally
+   `GEMINI_API_KEYS` for multi-key rotation) — everything else has working defaults in
+   `app/config.py`. `PORT` is injected by Render and picked up automatically (the Dockerfile's
+   `CMD` uses `${PORT:-8000}`).
+3. Health check path: `/health`.
+4. **Keep-alive (the free tier's one catch):** Render spins a free service down after 15 minutes
+   with no traffic, and takes ~1 minute to wake back up — too slow against the judge's 30s
+   timeout on a cold hit. A free [cron-job.org](https://cron-job.org) job pings `/health` every
+   5–10 minutes so it never gets the chance to sleep.
+
+**Verify it from outside:**
+
+```bash
+bash scripts/smoke_test.sh https://gridwise-9fk6.onrender.com
+python scripts/run_public_samples.py --base-url https://gridwise-9fk6.onrender.com
+```
 
 ## Docker
 
