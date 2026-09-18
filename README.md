@@ -13,6 +13,20 @@ with a linear program (SciPy HiGHS). See [planning.md](planning.md) for the full
 | Hallucination / paraphrase eval (live) | our 45 unseen notes: 45/45 · another team's 57 hand-labelled notes: 57/57 (after two guardrail fixes) |
 | Offline test suite | 229 tests (unit, golden incl. 53 external judge-style cases, integration, 40 randomized scenarios vs an independent LP) |
 
+## Contents
+
+- [Architecture](#architecture)
+- [Project structure](#project-structure)
+- [Quickstart](#quickstart)
+- [Configuration and model/provider](#configuration-and-modelprovider)
+- [Public-sample test procedure](#public-sample-test-procedure)
+- [Deployment (live endpoint)](#deployment-live-endpoint)
+- [Docker](#docker)
+- [Demo frontend](#demo-frontend-frontend)
+- [The reasoning UI (debug)](#the-reasoning-ui-debug)
+- [Testing](#testing)
+- [Dependencies, credits, limitations](#dependencies-credits-limitations)
+
 ## Architecture
 
 ```mermaid
@@ -37,6 +51,30 @@ flowchart LR
 - `app/verification` — the judge-mirror replay validator (also usable against ground truth).
 - `app/pipeline` — the end-to-end orchestrator and request deadline.
 - `app/static/index.html` — a small UI for exploring the reasoning trace (see below).
+
+## Project structure
+
+```
+.
+├── app/                    FastAPI service (see Architecture above for what each module does)
+│   ├── api/                routes, request parsing, error → HTTP status mapping
+│   ├── schemas/             request/response/LLM-output Pydantic models
+│   ├── llm/                 Gemini client, fallback chain, interpreter, prompts, cache
+│   ├── guardrails/          normalizer, Section-08 validator, cross-check, rule fallback
+│   ├── optimizer/           constraints → LP model → solver → post-processing
+│   ├── verification/        judge-mirror replay validator
+│   ├── pipeline/            end-to-end orchestrator + request deadline
+│   ├── summary/             deterministic plan_summary text
+│   └── static/index.html    debug reasoning UI, served at /ui/
+├── frontend/               the demo UI (separate from app/static), served at /app/
+├── tests/                  unit, golden, integration, property, live (see Testing below)
+├── scripts/                eval, public-sample runner, secret scan, smoke test
+├── docs/                   architecture/testing/deployment notes (in progress)
+├── .github/workflows/      CI (lint + offline tests + secret scan) and Docker publish to GHCR
+├── planning.md             the full design doc — architecture, LLM/optimizer design, rubric mapping
+├── Dockerfile / docker-compose.yml
+└── requirements.txt / requirements-dev.txt / pyproject.toml
+```
 
 ## Quickstart
 
