@@ -8,7 +8,7 @@ with a linear program (SciPy HiGHS). See [planning.md](planning.md) for the full
 | | |
 |---|---|
 | Live API | `<LIVE_URL>` — `GET /health`, `POST /optimize-energy` (see "Deployment" below) |
-| Docker image | `ghcr.io/animahou/gridwise-llm:v1.0.0` (linux/amd64 + linux/arm64) |
+| Docker image | `ghcr.io/animahou/gridwise-llm:v1.0.1` (linux/amd64 + linux/arm64) |
 | Public samples (live Gemini) | **10/10** interpretations exact · **10/10** plans valid vs ground truth · **10/10** optimal cost · p95 ≈ 2.0 s |
 | Hallucination / paraphrase eval (live) | our 45 unseen notes: 45/45 · another team's 57 hand-labelled notes: 57/57 (after two guardrail fixes) |
 | Offline test suite | 229 tests (unit, golden incl. 53 external judge-style cases, integration, 40 randomized scenarios vs an independent LP) |
